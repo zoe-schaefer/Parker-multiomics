@@ -1,0 +1,1170 @@
+---
+title: "Multi-omics data analysis"
+author: "Zoe Schaefer"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    number_sections: true
+    code_download: true
+    df_print: kable
+bibliography: references.bib
+---
+
+This pipeline is intended for use with three levels of proteomics data: total proteome, phosphoproteome, and histone proteome. See @Schaefer2024 for more detail on the total and histone proteome; phosphoproteome data is from @choudhary2020. Total and phosphoproteome data are designed to be input as an Excel sheet from Proteome Discoverer, and the histone data are the aggregated ratios from EpiProfile (@Yuan2018).
+
+For the reader, code chunks are collapsible in-text. The full R Markdown source document can also be downloaded from this page by clicking the "Code" dropdown above. Additionally, we have made available the files generated from our data at the project repository on Github. Other files can be downloaded from their respective sources.
+
+```{r setup}
+knitr::opts_chunk$set(
+  echo = TRUE, tidy = "styler", fig.asp = 0.6
+)
+
+library(pacman)
+p_load(
+  EnhancedVolcano, readxl, tidyverse, lintr, Homo.sapiens, DOSE, data.table,
+  clusterProfiler, enrichplot, ggvenn, OrganismDbi, eulerr, httpgd, viridis, scales
+)
+
+theme_pipeline <- theme_set(theme_gray() + theme(
+  plot.title.position = "plot",
+  plot.title = element_text(hjust = 0.5)))
+```
+
+# Proteome data processing
+
+This section is designed to work with normalized abundance data from Proteome Discoverer. The `total_path` variable should point directly to the Excel file containing the data you would like to use. The range identified in the `read_xlsx` command should contain columns from "Accession" to the final "Found in Sample:" column.
+
+```{r total-data-import}
+# Read in normalized abundance data starting with Accession column
+total_path <- "~/Documents/R/33060_Control_vs_Infection_JMI_abundances_normalizedabundances.xlsx"
+total_KB <- read_xlsx(path = total_path, range = cell_cols(c("D:BI")))
+
+total_KB <- select(
+  total_KB,
+  c("Accession",
+    starts_with(
+      c("Abundance Ratio (log2):", "Abundance Ratio Adj. P-Value:", "Found in Sample:")
+      )
+    )
+  )
+```
+```{r total-key-map, message=FALSE}
+# Retrieve keys and assign symbol to numerical Entrez ID
+# (KEGG mapping gives an error if this isn't included)
+# Example: given Entrez ID 3043, assign Uniprot accession number P68871,
+# then map the gene symbol HBB for easier interpretation later.
+reflist <- OrganismDbi::select(
+  Homo.sapiens,
+  keys = keys(Homo.sapiens,keytype = "UNIPROT"),
+  columns = c("ENTREZID", "SYMBOL"), keytype = "UNIPROT")
+total_KB <- full_join(total_KB, reflist, by = join_by(Accession == UNIPROT))
+
+# Getting rid of this huge variable to save space
+rm(reflist)
+
+# Drop invalid data (NA), drop any duplicate cases, rename columns for clarity
+total_KB <- total_KB %>%
+  drop_na(SYMBOL) %>%
+  distinct(SYMBOL, .keep_all = TRUE) %>%
+  rename("log2(FC)" = starts_with("Abundance Ratio (log2)"),
+         "P value" = starts_with("Abundance Ratio Adj. P-Value")
+)
+
+# Remove points with invalid P values (horizontal line at the top of a plot),
+# assign symbols to row names
+total_KB <- total_KB %>%
+  filter(`P value` > 5.3e-16) %>%
+  mutate("SYMBOL2" = `SYMBOL`) %>% 
+  column_to_rownames(var = "SYMBOL")
+
+# Set threshold values for proteome analysis
+total_p_threshold <- 0.05
+total_FC_threshold <- 0.5
+
+# Subset the data for plotting later - anything with P < threshold
+total_significant <- filter(total_KB, `P value` < total_p_threshold)
+```
+
+## Volcano
+
+Figure 1.1a is a general volcano plot, showing a visualization of the full dataset.
+
+The `max.overlaps` parameter in the `geom_text_repel` call should be carefully adjusted. The plot may have to be generated multiple times to get an appropriate labeling count. Setting this value to `Inf` is possible, but will likely overwhelm the plot and no points will be visible.
+
+```{r total-volcano-plot}
+# Generating overall volcano plot
+# Setting categories for differential expression:
+# not significant, P-value only, FC only, both
+total_KB$DiffExp <- case_when(
+  abs(total_KB$`log2(FC)`) >= total_FC_threshold &
+    total_KB$`P value` > total_p_threshold ~ "FC only",
+  abs(total_KB$`log2(FC)`) < total_FC_threshold &
+    total_KB$`P value` <= total_p_threshold ~ "P val. only",
+  abs(total_KB$`log2(FC)`) >= total_FC_threshold &
+    total_KB$`P value` <= total_p_threshold ~ "FC and P val.",
+  .default = "NS"
+)
+total_KB$DiffExp <- factor(total_KB$DiffExp,
+                           levels = c("FC and P val.", "P val. only", "FC only", "NS"))
+
+# Setting alpha values and labels so the significant points are most visible
+total_KB$DEAlpha <- 0.3
+total_KB$DEAlpha[abs(total_KB$`log2(FC)`) >= total_FC_threshold &
+                   total_KB$`P value` <= total_p_threshold] <- 0.8
+
+total_KB$labels <- if_else(
+  abs(total_KB$`log2(FC)`) >= total_FC_threshold &
+    total_KB$`P value` <= total_p_threshold, total_KB$SYMBOL2, "")
+
+ggplot(total_KB, aes(x = `log2(FC)`, y = -log10(`P value`))) +
+  geom_point(aes(color = DiffExp, alpha = DEAlpha)) +
+  geom_vline(xintercept = c(total_FC_threshold, -total_FC_threshold),
+             alpha = 0.5, linetype = "dashed") +
+  geom_hline(yintercept = -log10(total_p_threshold),
+             alpha = 0.5, linetype = "dashed") +
+  geom_text_repel(aes(label = labels), show.legend = FALSE, size = rel(3)) +
+  guides(alpha = "none") +
+  labs(x = "log2(Fold Change)", y = "-log10(P value)",
+       title = "Figure 1.1a: Volcano plot",
+       color = "Category") +
+  theme(legend.position = "bottom") +
+  scale_fill_viridis_d(
+    aesthetics = "color", option = "magma",
+    begin = 0.2, end = 0.9
+  )
+```
+
+If there are known genes of interest to be included in a plot, Figure 1.1b plots these points on top of the full dataset as a background.
+
+```{r total-grouping}
+# Defining known genes of interest for a second plot
+Group1 <- c("MORF4L1", "SAMSN1", "DTX3L", "MBD3",  "HSF1", "EYA3",
+               "NCAPD2", "TAF9", "PPP4C", "ZNF638")
+Group2 <- c("CD276", "CDK6", "CD9", "CD82", "NFKB1", "BST2", "CTSH")
+
+# Assigning shapes and labels for each group in the volcano plot,
+# leaving points unlabeled if outside the groups
+total_KB$CatShapes <- case_when(
+  total_KB$SYMBOL2 %in% Group1 ~ "1",
+  total_KB$SYMBOL2 %in% Group2 ~ "2",
+  .default = "20"
+)
+
+total_KB$CatNames <- case_when(
+  total_KB$SYMBOL2 %in% Group1 | total_KB$SYMBOL2 %in% Group2 ~ total_KB$SYMBOL2,
+  .default = ""
+)
+```
+
+```{r total-grouped-volcano-plot}
+# Generating volcano plot
+# arrange() command sorts the named points on top so they aren't buried underneath
+ggplot(arrange(total_KB, CatNames), aes(x = `log2(FC)`, y = -log10(`P value`))) +
+  geom_point(aes(shape = CatShapes, color = CatShapes)) +
+  geom_vline(xintercept = c(total_FC_threshold, -total_FC_threshold), alpha = 0.5, linetype = "dashed") +
+  geom_hline(yintercept = -log10(total_p_threshold), alpha = 0.5, linetype = "dashed") +
+  geom_text_repel(aes(label = CatNames), size = rel(3), show.legend = FALSE, max.overlaps = Inf) +
+  guides(alpha = "none", shape = "none") +
+  labs(x = "log2(Fold Change)", y = "-log10(P value)",
+       title = "Figure 1.1b: Volcano plot with groups") +
+  theme(legend.position = "bottom") +
+  scale_fill_viridis_d("Category",
+    aesthetics = "color", option = "magma",
+    begin = 0.2, end = 0.9,
+    labels = c("Group 2", "Group 1", "None")
+  )
+```
+
+## Pathway enrichment
+
+This section performs a pathway analysis on the significant proteins alone to reduce computational load when calling `enrichGO` and `enrichKEGG`. These variables can be easily adjusted to analyze all proteins together if desired.
+
+In our source dataset, there were no downregulated KEGG pathways. This causes error messages, so the "Total KEGG down" plot has been removed. The call to `labels` below illustrates a difficulty with plotting long ontology terms, but the `label_format` parameter is an easy way to solve this. Outside of `enrichplot::dotplot`, calling `label_wrap` from `labels` and passing a character count to wrap at is a good solution. We also show a way to manually replace long names later in this section.
+
+```{r total-enrich}
+# Separate total_significant subset into upregulated vs downregulated
+total_significant_up <- filter(total_significant, `log2(FC)` > 0)
+total_significant_down <- filter(total_significant, `log2(FC)` < 0)
+
+# Enriching for *total* GO terms - optional, can be used to visualize overall results
+total_GO_up <- enrichGO(total_significant_up$ENTREZID, "org.Hs.eg.db")
+total_GO_down <- enrichGO(total_significant_down$ENTREZID, "org.Hs.eg.db")
+
+# Enrich for KEGG pathways
+total_KEGG_up <- enrichKEGG(total_significant_up$ENTREZID)
+total_KEGG_down <- enrichKEGG(total_significant_down$ENTREZID)
+
+# dotplot() can be used for an overview of the relationships between key terms
+dotplot(total_KEGG_up, showCategory = 20, font.size = rel(1),
+        title = "Figure 1.2a: Total KEGG up") +
+  theme(plot.title.position = "plot", plot.title = element_text(hjust = 0.5))
+dotplot(total_GO_up, showCategory = 20, font.size = rel(1),
+        title = "Figure 1.2b: Total GO up (unwrapped)") +
+  theme(plot.title.position = "plot", plot.title = element_text(hjust = 0.5))
+dotplot(total_GO_up, showCategory = 20, font.size = rel(1),
+        title = "Figure 1.2c: Total GO up (wrapped)", label_format = 60) +
+  theme(plot.title.position = "plot", plot.title = element_text(hjust = 0.5))
+dotplot(total_GO_down, showCategory = 20, font.size = rel(1),
+        title = "Figure 1.2d: Total GO down") +
+  theme(plot.title.position = "plot", plot.title = element_text(hjust = 0.5))
+```
+
+For each subset of data, the top 10 terms are found in each GO aspect (molecular function (MF), biological process (BP), cellular component (CC)). To include more terms, adjust the `n = 10` parameter in the calls to `slice_min()`.
+
+In this section, we also reword some very long GO terms to fit them in an appropriate-size plot. This list will need to be adjusted based on the enriched terms in an individual dataset.
+
+```{r total-GO-up-split}
+# Separating the GO terms by ontology aspect
+total_GO_up_MF <- enrichGO(total_significant_up$ENTREZID,
+  "org.Hs.eg.db", ont = "MF"
+  )
+total_GO_up_BP <- enrichGO(total_significant_up$ENTREZID,
+  "org.Hs.eg.db", ont = "BP"
+  )
+total_GO_up_CC <- enrichGO(total_significant_up$ENTREZID,
+  "org.Hs.eg.db", ont = "CC"
+  )
+```
+
+```{r total-GO-up-clean}
+# Taking the top 10 enriched GO terms in each category by P value
+total_GO_up_slice_MF <- slice_min(
+  filter(total_GO_up_MF@result, p.adjust < 0.05),
+  order_by = `p.adjust`, n = 10
+)
+total_GO_up_slice_BP <- slice_min(
+  filter(total_GO_up_BP@result, p.adjust < 0.05),
+  order_by = `p.adjust`, n = 10
+)
+total_GO_up_slice_CC <- slice_min(
+  filter(total_GO_up_CC@result, p.adjust < 0.05),
+  order_by = `p.adjust`, n = 10
+)
+# Combining top 10 terms in each aspect
+total_GO_up_slice_ALL <- bind_rows(
+  "MF" = total_GO_up_slice_MF,
+  "BP" = total_GO_up_slice_BP,
+  "CC" = total_GO_up_slice_CC,
+  .id = "Ontology"
+)
+total_GO_up_slice_ALL$GR <- parse_ratio(total_GO_up_slice_ALL$GeneRatio)
+
+# Added in to shorten names when plotted - this can be removed or adjusted
+total_GO_up_slice_ALL["Description"][total_GO_up_slice_ALL["Description"] == "hydrolase activity, acting on carbon-nitrogen (but not peptide) bonds"] <- "hydrolase, C-N non-peptide bonds"
+total_GO_up_slice_ALL["Description"][total_GO_up_slice_ALL["Description"] == "hydrolase activity, acting on carbon-nitrogen (but not peptide) bonds, in cyclic amidines"] <- "hydrolase, C-N non-peptide bonds in cyclic amidines"
+total_GO_up_slice_ALL["Description"][total_GO_up_slice_ALL["Description"] == "antigen processing and presentation of endogenous peptide antigen via MHC class I"] <- "endogenous antigen processing and presentation (MHC class I)"
+total_GO_up_slice_ALL["Description"][total_GO_up_slice_ALL["Description"] == "antigen processing and presentation of peptide antigen via MHC class I"] <- "peptide antigen processing and presentation (MHC class I)"
+total_GO_up_slice_ALL["Description"][total_GO_up_slice_ALL["Description"] == "antigen processing and presentation of endogenous peptide antigen"] <- "endogenous antigen processing and presentation"
+total_GO_up_slice_ALL["Description"][total_GO_up_slice_ALL["Description"] == "exonuclease activity, active with either ribo- or deoxyribonucleic acids and producing 5'-phosphomonoesters"] <- "5'-exonucleases"
+
+
+# Reordering the top terms by gene ratio
+total_GO_up_slice_ALL$Description <- fct_reorder(
+  total_GO_up_slice_ALL$Description, total_GO_up_slice_ALL$GR
+)
+```
+
+```{r total-KEGG-up-enrich}
+# Repeat for KEGG
+# Taking the top 10 enriched terms by P value
+total_KEGG_up_slice <- slice_min(filter(total_KEGG_up@result, p.adjust < 0.05),
+  order_by = `p.adjust`, n = 10
+)
+# Reordering the top terms by gene ratio
+total_KEGG_up_slice$GR <- parse_ratio(total_KEGG_up_slice$GeneRatio)
+total_KEGG_up_slice$Description <- fct_reorder(
+  total_KEGG_up_slice$Description, total_KEGG_up_slice$GR
+)
+total_KEGG_up_slice$Ontology <- "KEGG"
+```
+
+```{r total-up-combine}
+# Combining GO and KEGG for upregulated proteins
+total_up_bound <- bind_rows(
+  total_GO_up_slice_ALL, total_KEGG_up_slice
+)
+total_up_bound$Description <- fct_reorder(
+  total_up_bound$Description, total_up_bound$GR
+)
+
+# Manually ordering factors to display all GO aspects together
+total_up_bound$Ontology <- factor(total_up_bound$Ontology,
+  levels = c("BP", "CC", "MF", "KEGG")
+)
+```
+
+```{r total-up-pathways, fig.asp = 0.9}
+# Graphing all 4 categories together
+ggplot(total_up_bound,
+  # Gene ratio on X axis, verbose pathway description on Y axis
+  # Coloring by adjusted P value and size by the count of genes in a pathway
+  aes(x = GR, y = Description, color = p.adjust, size = Count)
+  ) +
+  scale_y_discrete(labels = label_wrap(70)) +
+  geom_count() +
+  labs(
+    x = "Gene ratio", y = "Pathway",
+    title = "Figure 1.2e: Upregulated pathways"
+  ) +
+  scale_fill_viridis(
+    aesthetics = "color", option = "magma",
+    name = "Adjusted P", begin = 0, end = 0.9
+  ) +
+  scale_shape_manual(values = c(25, 24)) +
+  facet_grid(Ontology ~ .,
+    drop = TRUE, space = "free_y", scales = "free_y"
+  ) +
+  theme(
+    strip.text = element_text(size = 10),
+    panel.spacing = unit(0.6, "lines"),
+    axis.text.y = element_text(size = rel(1.1)),
+    panel.background = element_rect(fill = "white"),
+    panel.border = element_rect(fill = NA, color = "light gray"),
+    panel.grid = element_line(color = "gray90")
+  )
+```
+
+```{r total-GO-down-split}
+# Same process as the previous chunk
+# Separating the GO terms by ontology aspect
+total_GO_down_MF <- enrichGO(total_significant_down$ENTREZID,
+  "org.Hs.eg.db", ont = "MF"
+)
+total_GO_down_BP <- enrichGO(total_significant_down$ENTREZID,
+  "org.Hs.eg.db", ont = "BP"
+)
+total_GO_down_CC <- enrichGO(total_significant_down$ENTREZID,
+  "org.Hs.eg.db", ont = "CC"
+)
+```
+
+```{r total-down-clean}
+# Taking the top 10 enriched terms in each category by P value
+total_GO_down_slice_MF <- slice_min(
+  filter(total_GO_down_MF@result, p.adjust < 0.05),
+  order_by = `p.adjust`, n = 10
+)
+total_GO_down_slice_BP <- slice_min(
+  filter(total_GO_down_BP@result, p.adjust < 0.05),
+  order_by = `p.adjust`, n = 10
+)
+total_GO_down_slice_CC <- slice_min(
+  filter(total_GO_down_CC@result, p.adjust < 0.05),
+  order_by = `p.adjust`, n = 10
+)
+
+# Combining top 10 terms in each aspect
+total_down_bound <- bind_rows(
+  "MF" = total_GO_down_slice_MF,
+  "BP" = total_GO_down_slice_BP,
+  "CC" = total_GO_down_slice_CC,
+  .id = "Ontology"
+)
+total_down_bound$GR <- parse_ratio(total_down_bound$GeneRatio)
+
+# Reordering the top terms by gene ratio
+total_down_bound$Description <- fct_reorder(
+  total_down_bound$Description, total_down_bound$GR
+)
+total_down_bound$Ontology <- factor(total_down_bound$Ontology,
+  levels = c("BP", "CC", "MF", "KEGG")
+)
+
+# KEGG enrichment did not show anything so it caused an error in our data and has been removed
+# If desired, KEGG enrichment can be performed here as in the previous chunk
+```
+
+```{r total-down-pathways}
+ggplot(total_down_bound,
+       aes(x = GR, y = Description, color = p.adjust, size = Count)) +
+  geom_count() +
+  labs(
+    x = "Gene ratio", y = "Pathway",
+    title = "Figure 1.2f: Downregulated pathways"
+  ) +
+  scale_fill_viridis(
+    aesthetics = "color", option = "magma",
+    name = "Adjusted P", begin = 0, end = 0.9
+  ) +
+  scale_shape_manual(values = c(25, 24)) +
+  facet_grid(Ontology ~ .,
+    drop = TRUE, space = "free_y",
+    scales = "free_y"
+  ) +
+  theme(
+    strip.text = element_text(size = 10),
+    panel.spacing = unit(0.6, "lines"),
+    axis.text.y = element_text(size = rel(1.1)),
+    panel.background = element_rect(fill = "white"),
+    panel.border = element_rect(fill = NA, color = "light gray"),
+    panel.grid = element_line(color = "gray90")
+  )
+```
+
+Figure 1.2c clusters terms by function, which shows enriched domains.
+
+```{r total-map, fig.asp = 1}
+# Plotting the enrichment plot for one aspect of upregulated pathways
+# Enrich first with pairwise_term_sim, then generate the plot itself
+total_GO_up_MF <- pairwise_termsim(total_GO_up_MF)
+emapplot(total_GO_up_MF, layout = "nicely", node_label = "none") +
+  ggtitle("Figure 1.2g: Upregulated enrichment plot (MF)") +
+  geom_text_repel(aes(label = str_wrap(name, width = 60))) +
+  theme(plot.title.position = "plot", plot.title = element_text(hjust = 0.5),
+        plot.margin = margin(1, 1, 1, 1))
+```
+
+# Phosphoproteome data processing
+
+This section is written to interpret phosphoproteome data. Here, we do not account for particular phosphorylation sites or their functions. The original data is from @choudhary2020. Below is a reprocessing of this data to align with the total and histone proteome.
+
+```{r phospho-import, warning = FALSE, message = FALSE}
+# Read in phosphoproteome data, assign symbol to row names
+# Already formatted so there's no need to map with reflist
+phospho_raw <- read_xlsx("~/Documents/R/PXD_raw.xlsx")
+phospho_raw <- phospho_raw %>%
+  mutate("SYMBOL2" = `SYMBOL`) %>%
+  column_to_rownames(var = "SYMBOL") %>%
+  drop_na(SYMBOL2, `log2(FC)`, `P value`) %>%
+  distinct(SYMBOL2, .keep_all = TRUE) %>%
+  mutate(`...6` = NULL)
+
+# Set threshold values for proteome analysis
+phospho_p_threshold <- 0.05
+phospho_FC_threshold <- 0.5
+
+phospho_significant <- filter(phospho_raw, `P value` < phospho_p_threshold)
+```
+
+## Volcano
+
+```{r phospho-grouping}
+# Repeating the processes from before
+# If your groups are too large, they will not display as all labeled at once
+Group1_phospho <- c(
+  "HJURP", "CHAF1B", "RBL1", "EYA3", "BRCA1",
+  "NCOA6", "PALB2", "BARD1", "REPS2", "ZNF511", "BRWD1",
+  "L3MBTL3", "WDR76", "CHAF1A", "PIAS2", "RUNX1", "RB1", "JDP2",
+  "EP400", "MRGBP", "EMSY", "RYBP", "HIRIP3", "TOPBP1",
+  "MGA", "PRDM8", "EZH2", "HDAC5", "DMAP1", "NPAT", "SAP130",
+  "SAMD1", "ZMYND8", "ASH1L", "ARID1B", "HDAC4", "BRD9", "NCOR1",
+  "MCM3AP", "UTP3", "ZZEF1", "DNTTIP1", "PRKD1", "MTA1", "SATB2",
+  "KANSL3", "REST", "SIRT6", "PHC2", "TOPORS", "JMJD1C", "BRD2",
+  "ATF7IP", "SP1", "KANSL1", "BMI1", "COMMD3-BMI1", "KMT2C", "ASXL2",
+  "TP53BP1", "YY1AP1", "WAC", "BAP1", "L3MBTL2", "ZNF518A", "MBD3",
+  "OBI1", "DOT1L", "KDM5C", "RING1", "USP16", "CNOT3", "ATXN1L", "RCOR3",
+  "RCOR2", "SCML2", "KMT2D", "ARID1A", "GATAD2B", "ATM", "GTF3C4", "SP140",
+  "CHD8", "BPTF", "MECP2", "AHCTF1", "KDM5A", "MYSM1", "ATF7IP2", "NIPBL",
+  "LRWD1", "ASH2L", "MARK3", "RRP1B", "EP300", "EHMT2", "TNRC18", "MDC1",
+  "RAI1", "CIR1", "FOXO3", "ASXL1", "UBE2O", "KDM2B", "DPF2", "BRD4",
+  "NACC1", "CHD4", "TRIM28", "RUVBL1", "ACTL6B", "DDB1", "ACTL6A",
+  "STK4", "CARM1", "SUMO3", "ENY2", "CUL5", "PHF5A", "SIRT2", "PKN1",
+  "MAPKAPK2", "MAGEA1", "ZNF518B", "SMCHD1", "DLD", "MEN1", "HDAC6",
+  "DTX3L", "PSMA8", "H1-6", "PML", "NEK6", "PHF20L1", "RBBP6"
+)
+Group2_phospho <- c(
+  "FANCI", "CDK14", "PRDM1", "ICAM1", "CDK1", "RUNX3", "NOTCH3", "CASP8",
+  "BST2", "CTSL", "MX2", "CASP1", "STAT2", "MX1"
+)
+```
+
+```{r phospho-categories}
+phospho_raw$DiffExp <- case_when(
+  abs(phospho_raw$`log2(FC)`) >= phospho_FC_threshold &
+    phospho_raw$`P value` > phospho_p_threshold ~ "FC only",
+  abs(phospho_raw$`log2(FC)`) < phospho_FC_threshold &
+    phospho_raw$`P value` <= phospho_p_threshold ~ "P val. only",
+  abs(phospho_raw$`log2(FC)`) >= phospho_FC_threshold &
+    phospho_raw$`P value` <= phospho_p_threshold ~ "FC and P val.",
+  .default = "NS"
+)
+phospho_raw$DiffExp <- factor(phospho_raw$DiffExp,
+                           levels = c("FC and P val.", "P val. only", "FC only", "NS"))
+
+# Adding in an alpha value due to point spread and higher hit count
+phospho_raw$DEAlpha <- 0.3
+phospho_raw$DEAlpha[abs(phospho_raw$`log2(FC)`) >= phospho_FC_threshold &
+                   phospho_raw$`P value` <= phospho_p_threshold] <- 0.8
+
+
+
+# Picking a much smaller subset of points in Group 1 to label just for ease of viewing
+Group1_phospho_sub <- c(
+  "ASH2L", "ASXL1", "ASXL2", "BAP1", "BMI1", "CHD4", "EZH2", "DMAP1",
+  "EP400", "GATAD2B", "KANSL1", "KANSL3", "KMT2C", "KMT2D", "MBD3",
+  "MEN1", "MGA", "MRGBP", "MTA1", "NCOA6", "PHC2", "PHF20L1", "REST",
+  "RING1", "RUVBL1", "SAP130", "SCML2", "SIRT3", "SIRT6", "EP300"
+)
+phospho_raw$labels <- if_else(
+  abs(phospho_raw$`log2(FC)`) >= phospho_FC_threshold &
+    phospho_raw$`P value` <= phospho_p_threshold, phospho_raw$SYMBOL2, "")
+```
+
+```{r phospho-grouped-volcano-plot}
+ggplot(phospho_raw, aes(x = `log2(FC)`, y = -log10(`P value`))) +
+  geom_point(aes(color = DiffExp, alpha = DEAlpha)) +
+  geom_vline(xintercept = c(phospho_FC_threshold, -phospho_FC_threshold),
+             alpha = 0.5, linetype = "dashed") +
+  geom_hline(yintercept = -log10(phospho_p_threshold),
+             alpha = 0.5, linetype = "dashed") +
+  geom_text_repel(aes(label = labels), show.legend = FALSE, max.overlaps = 20,
+                  size = rel(3)) +
+  guides(alpha = "none") +
+  labs(x = "log2(Fold Change)", y = "-log10(P value)",
+       title = "Figure 2.1a: Volcano plot",
+       color = "Category") +
+  theme(legend.position = "bottom") +
+  scale_fill_viridis_d(
+    aesthetics = "color", option = "magma",
+    begin = 0.2, end = 0.9
+  )
+```
+
+## Pathway enrichment
+
+```{r phospho-enrich}
+# Separate phospho_significant subset into upregulated vs downregulated
+phospho_significant_up <- filter(phospho_significant, `log2(FC)` > 0)
+phospho_significant_down <- filter(phospho_significant, `log2(FC)` < 0)
+
+# Enriching for *total* GO terms - optional, can be used to visualize overall results
+phospho_GO_up <- enrichGO(phospho_significant_up$ENTREZID, "org.Hs.eg.db")
+phospho_GO_down <- enrichGO(phospho_significant_down$ENTREZID, "org.Hs.eg.db")
+
+# Enrich for KEGG pathways
+phospho_KEGG_up <- enrichKEGG(phospho_significant_up$ENTREZID)
+phospho_KEGG_down <- enrichKEGG(phospho_significant_down$ENTREZID)
+
+# dotplot() can be used for an overview of the relationships between key terms
+dotplot(phospho_KEGG_up, showCategory = 20, font.size = rel(1),
+        title = "Figure 2.2a: Phospho KEGG up", label_format = 50) +
+  theme(plot.title.position = "plot", plot.title = element_text(hjust = 0.5))
+dotplot(phospho_KEGG_down, showCategory = 20, font.size = rel(1),
+        title = "Figure 2.2b: Phospho KEGG down", label_format = 50) +
+  theme(plot.title.position = "plot", plot.title = element_text(hjust = 0.5))
+dotplot(phospho_GO_up, showCategory = 20, font.size = rel(1),
+        title = "Figure 2.2c: Phospho GO up", label_format = 70) +
+  theme(plot.title.position = "plot", plot.title = element_text(hjust = 0.5))
+dotplot(phospho_GO_down, showCategory = 20, font.size = rel(1),
+        title = "Figure 2.2d: Phospho GO down", label_format = 50) +
+  theme(plot.title.position = "plot", plot.title = element_text(hjust = 0.5))
+```
+
+```{r phospho-GO-up-split}
+# Separating the GO terms by ontology aspect
+phospho_GO_up_MF <- enrichGO(phospho_significant_up$ENTREZID,
+  "org.Hs.eg.db", ont = "MF"
+)
+phospho_GO_up_BP <- enrichGO(phospho_significant_up$ENTREZID,
+  "org.Hs.eg.db", ont = "BP"
+)
+phospho_GO_up_CC <- enrichGO(phospho_significant_up$ENTREZID,
+  "org.Hs.eg.db", ont = "CC"
+)
+```
+
+```{r phospho-GO-up-clean}
+# Taking the top 10 enriched terms in each category by P value
+phospho_GO_up_slice_MF <- slice_min(
+  filter(phospho_GO_up_MF@result, p.adjust < 0.05),
+  order_by = `p.adjust`, n = 10
+)
+phospho_GO_up_slice_BP <- slice_min(
+  filter(phospho_GO_up_BP@result, p.adjust < 0.05),
+  order_by = `p.adjust`, n = 10
+)
+phospho_GO_up_slice_CC <- slice_min(
+  filter(phospho_GO_up_CC@result, p.adjust < 0.05),
+  order_by = `p.adjust`, n = 10
+)
+
+# Combining top 10 terms in each aspect
+phospho_GO_up_slice_ALL <- bind_rows(
+  "MF" = phospho_GO_up_slice_MF,
+  "BP" = phospho_GO_up_slice_BP,
+  "CC" = phospho_GO_up_slice_CC,
+  .id = "Ontology"
+)
+phospho_GO_up_slice_ALL$GR <- parse_ratio(phospho_GO_up_slice_ALL$GeneRatio)
+
+# Added in to shorten names when plotted - this can be removed or adjusted
+phospho_GO_up_slice_ALL["Description"][phospho_GO_up_slice_ALL["Description"] == "oxidoreductase activity, acting on the aldehyde or oxo group of donors, NAD or NADP as acceptor"] <- "oxidoreductase, aldehyde/oxo donor, NAD/NADP acceptor"
+
+# Reordering the top terms by gene ratio
+phospho_GO_up_slice_ALL$Description <- fct_reorder(
+  phospho_GO_up_slice_ALL$Description, phospho_GO_up_slice_ALL$GR
+)
+```
+
+```{r phospho-KEGG-up-enrich}
+# Repeat for KEGG
+# Taking the top 10 enriched terms by P value
+phospho_KEGG_up_slice <- slice_min(
+  filter(phospho_KEGG_up@result, p.adjust < 0.05),
+  order_by = `p.adjust`, n = 10
+)
+
+# Reordering the top terms by gene ratio
+phospho_KEGG_up_slice$GR <- parse_ratio(phospho_KEGG_up_slice$GeneRatio)
+phospho_KEGG_up_slice$Description <- fct_reorder(
+  phospho_KEGG_up_slice$Description,
+  phospho_KEGG_up_slice$GR
+)
+phospho_KEGG_up_slice$Ontology <- "KEGG"
+```
+
+```{r phospho-up-combine}
+# Combining GO and KEGG for upregulated proteins
+phospho_up_bound <- bind_rows(
+  phospho_GO_up_slice_ALL, phospho_KEGG_up_slice
+)
+phospho_up_bound$Description <- fct_reorder(
+  phospho_up_bound$Description, phospho_up_bound$GR
+)
+
+# Manually ordering factors to display all GO aspects together
+phospho_up_bound$Ontology <- factor(phospho_up_bound$Ontology,
+  levels = c("BP", "CC", "MF", "KEGG")
+)
+```
+
+```{r phospho-up-pathways, fig.asp = 0.9}
+# Graphing all 4 categories together
+ggplot(
+  phospho_up_bound,
+  # Gene ratio on X axis, verbose pathway description on Y axis
+  # Coloring by adjusted P value and size by the count of genes in a pathway
+  aes(x = GR, y = Description, color = p.adjust, size = Count)
+  ) +
+  scale_y_discrete(labels = label_wrap(80)) +
+  geom_count() +
+  labs(
+    x = "Gene ratio", y = "Pathway",
+    title = "Figure 2.2e: Upregulated pathways"
+  ) +
+  scale_fill_viridis(
+    aesthetics = "color", option = "magma",
+    name = "Adjusted P", begin = 0, end = 0.9
+  ) +
+  scale_shape_manual(values = c(25, 24)) +
+  facet_grid(Ontology ~ .,
+    drop = TRUE, space = "free_y",
+    scales = "free_y"
+  ) +
+  theme(
+    strip.text = element_text(size = 10),
+    panel.spacing = unit(0.6, "lines"),
+    axis.text.y = element_text(size = rel(1.1)),
+    panel.background = element_rect(fill = "white"),
+    panel.border = element_rect(fill = NA, color = "light gray"),
+    panel.grid = element_line(color = "gray90")
+  )
+```
+
+```{r phospho-GO-down-split}
+# Same process as the previous chunks
+# Separating the GO terms by ontology aspect
+phospho_GO_down_MF <- enrichGO(phospho_significant_down$ENTREZID,
+  "org.Hs.eg.db",
+  ont = "MF"
+)
+phospho_GO_down_BP <- enrichGO(phospho_significant_down$ENTREZID,
+  "org.Hs.eg.db",
+  ont = "BP"
+)
+phospho_GO_down_CC <- enrichGO(phospho_significant_down$ENTREZID,
+  "org.Hs.eg.db",
+  ont = "CC"
+)
+```
+
+```{r phospho-GO-down-clean}
+# Taking the top 10 enriched terms in each category by P value
+phospho_GO_down_slice_MF <- slice_min(
+  filter(phospho_GO_down_MF@result, p.adjust < 0.05),
+  order_by = `p.adjust`, n = 10
+)
+phospho_GO_down_slice_BP <- slice_min(
+  filter(phospho_GO_down_BP@result, p.adjust < 0.05),
+  order_by = `p.adjust`, n = 10
+)
+phospho_GO_down_slice_CC <- slice_min(
+  filter(phospho_GO_down_CC@result, p.adjust < 0.05),
+  order_by = `p.adjust`, n = 10
+)
+
+# Combining top 10 terms in each aspect
+phospho_down_bound <- bind_rows(
+  "MF" = phospho_GO_down_slice_MF,
+  "BP" = phospho_GO_down_slice_BP,
+  "CC" = phospho_GO_down_slice_CC,
+  .id = "Ontology"
+)
+```
+
+```{r phospho-KEGG-down-enrich}
+# Repeat for KEGG
+# Taking the top 10 enriched terms by P value
+phospho_KEGG_down_slice <- slice_min(
+  filter(phospho_KEGG_down@result, p.adjust < 0.05),
+  order_by = `p.adjust`, n = 10
+)
+
+# Reordering the top terms by gene ratio
+phospho_KEGG_down_slice$GR <- parse_ratio(phospho_KEGG_down_slice$GeneRatio)
+phospho_KEGG_down_slice$Description <- fct_reorder(
+  phospho_KEGG_down_slice$Description,
+  phospho_KEGG_down_slice$GR
+)
+phospho_KEGG_down_slice$Ontology <- "KEGG"
+```
+
+```{r phospho-down-combine}
+# Combining GO and KEGG for downregulated proteins
+phospho_down_bound <- bind_rows(
+  phospho_down_bound, phospho_KEGG_down_slice
+)
+phospho_down_bound$GR <- parse_ratio(phospho_down_bound$GeneRatio)
+
+phospho_down_bound$Description <- fct_reorder(
+  phospho_down_bound$Description, phospho_down_bound$GR
+)
+
+# Manually ordering factors to display all GO aspects together
+phospho_down_bound$Ontology <- factor(phospho_down_bound$Ontology,
+  levels = c("BP", "CC", "MF", "KEGG")
+)
+```
+
+```{r phospho-down-pathways, fig.asp = 0.9}
+# Graphing all 4 categories together
+ggplot(
+  phospho_down_bound,
+  # Gene ratio on X axis, verbose pathway description on Y axis
+  # Coloring by adjusted P value and size by the count of genes in a pathway
+  aes(x = GR, y = Description, color = p.adjust, size = Count)
+  ) +
+  scale_y_discrete(labels = label_wrap(70)) +
+  geom_count() +
+  labs(
+    x = "Gene ratio", y = "Pathway",
+    title = "Figure 2.2f: Downregulated pathways"
+  ) +
+  scale_fill_viridis(
+    aesthetics = "color", option = "magma",
+    name = "Adjusted P", begin = 0, end = 0.9
+  ) +
+  scale_shape_manual(values = c(25, 24)) +
+  facet_grid(Ontology ~ .,
+    drop = TRUE, space = "free_y",
+    scales = "free_y"
+  ) +
+  theme(
+    strip.text = element_text(size = 10),
+    panel.spacing = unit(0.6, "lines"),
+    axis.text.y = element_text(size = rel(1.1)),
+    panel.background = element_rect(fill = "white"),
+    panel.border = element_rect(fill = NA, color = "light gray"),
+    panel.grid = element_line(color = "gray90")
+  )
+```
+
+```{r emap-total, fig.asp = 1}
+phospho_GO_up_MF <- pairwise_termsim(phospho_GO_up_MF)
+emapplot(phospho_GO_up_MF, layout = "nicely", node_label = "none") +
+  geom_text_repel(aes(label = str_wrap(name, width = 60))) +
+  ggtitle("Figure 2.2g: Upregulated enrichment plot (phospho, MF)") +
+  theme(plot.title.position = "plot", plot.title = element_text(hjust = 0.5),
+        plot.margin = margin(1, 1, 1, 1))
+
+phospho_GO_down_MF <- pairwise_termsim(phospho_GO_down_MF)
+emapplot(phospho_GO_down_MF, layout = "nicely", node_label = "none") +
+  geom_text_repel(aes(label = str_wrap(name, width = 60))) +
+  ggtitle("Figure 2.2h: Downregulated enrichment plot (phospho, MF)") +
+  theme(plot.title.position = "plot", plot.title = element_text(hjust = 0.5),
+        plot.margin = margin(1, 1, 1, 1))
+```
+
+# Histone processing
+
+This section processes data output from EpiProfile. We choose to assess both tail fragments and individual summed PTMs to indicate co-occurrence, which may signify activity of certain epigenetic actors. Note that the exported `.xls` files will have to be opened manually one time, then saved again as `.xls(x)` format due to the output format. Into the `range` argument, pass the cell location of the first peptide name ("H3_3_8 unmod" in our data) to set the top left corner, then (NA, [target col]) as the second location to set the bottom right corner. This section assumes the data is separating two conditions, infected and control.
+
+```{r histone-import}
+histone_ratios_path <- "~/Documents/R/histone_ratios/histone_ratios.xls"
+histone_single_path <- "~/Documents/R/histone_ratios/histone_ratios_single_PTMs.xls"
+
+# The columns will have to be manually parsed - include the names (first column) and ratios for all samples
+histone_frag_raw <- drop_na(read_excel(path = histone_ratios_path, range = cell_limits(c(4, 1), c(NA, 11)), col_names = c("PTM", "C1", "I1", "C2", "I2", "C3", "I3", "C4", "I4", "C5", "I5")))
+
+histone_single_raw <- read_excel(path = histone_single_path, col_names = c("PTM", "C1", "I1", "C2", "I2", "C3", "I3", "C4", "I4", "C5", "I5"), range = cell_limits(c(2, 1), c(NA, 11)))
+
+# Set threshold values for proteome analysis
+histone_p_threshold <- 0.05
+histone_FC_threshold <- 0.5
+```
+
+## Fragments
+
+Name cleanup is not strictly necessary but makes labels easier to read. There may also be some long amino acid strings such as "H1 1-35 H12.SETAPAAPAAAPPAEKAPVKKKAAKKAGGTPR" that indicate a unique isoform (H1.2 in this case). These can also be modified by calling `str_replace_all` as desired.
+
+```{r fragment-histone-processing}
+# Cleaning up names
+ratios_frag <- histone_frag_raw
+ratios_frag$PTM <- ratios_frag$PTM %>% 
+  str_replace_all("H3_3_8", "H3 3-8") %>% 
+  str_replace_all("H3_9_17", "H3 9-17") %>% 
+  str_replace_all("H3_18_26", "H3 18-26") %>% 
+  str_replace_all("H3_27_40", "H3 27-40") %>% 
+  str_replace_all("H33_27_40", "H3.3 27-40") %>% 
+  str_replace_all("H3_41_49", "H3 41-49") %>% 
+  str_replace_all("H3_54_63", "H3 54-63") %>% 
+  str_replace_all("H3_73_83", "H3 73-83") %>% 
+  str_replace_all("H3_117_128", "H3 117-128") %>% 
+  str_replace_all("H4_4_17", "H4 4-17") %>% 
+  str_replace_all("H4_20_23", "H4 20-23") %>% 
+  str_replace_all("H4_24_35", "H4 24-35") %>% 
+  str_replace_all("H4_40_45", "H4 40-45") %>% 
+  str_replace_all("H4_79_92", "H4 79-92") %>% 
+  str_replace_all("H1_1_35", "H1 1-35") %>% 
+  str_replace_all("H1_54_81", "H1 54-71") %>% 
+  str_replace_all("H2A1_36_42", "H2A1 36-42") %>% 
+  str_replace_all("H2A3_36_42", "H2A3 36-42") %>% 
+  str_replace_all("H2AX_36_42", "H2AX 36-42") %>% 
+  str_replace_all("H2A1_4_11", "H2A1 4-11") %>% 
+  str_replace_all("H2AJ_4_11", "H2AJ 4-11") %>% 
+  str_replace_all("H2AX_4_11", "H2AX 4-11") %>% 
+  str_replace_all("H2A1_1_11", "H2A1 1-11") %>% 
+  str_replace_all("H2AV_1_19", "H2AV 1-19") %>% 
+  str_replace_all("H2AZ_1_19", "H2AZ 1-19") %>% 
+  str_replace_all("H2A1_12_17", "H2A1 12-17") %>% 
+  str_replace_all("H2A3_12_17", "H2A3 12-17") %>% 
+  str_replace_all("H2A1_72_77", "H2A1 72-77") %>% 
+  str_replace_all("H2A_82_88", "H2A 82-88") %>% 
+  str_replace_all("H2A_1_88", "H2A 1-88") %>% 
+  str_replace_all("H2B_1_29", "H2B 1-29")
+
+# Group two conditions together
+ratios_frag <- ratios_frag %>%
+  relocate(contains("I"), .after = last_col()) %>% 
+  relocate("PTM")
+
+# Calculate infected/control fold change and P value
+ratios_frag <- ratios_frag %>% 
+  rowwise() %>% 
+  mutate(c_mean = mean(c_across("C1":"C5")),
+         i_mean = mean(c_across("I1":"I5")),
+         FC = c_across(i_mean)/c_across(c_mean),
+         "log2(FC)" = log2(FC),
+         is_constant = all(c_across("C1":"C5") == c_across("I1":"I5")))
+
+ratios_frag <- column_to_rownames(ratios_frag, var = "PTM")
+ratios_frag$PTM <- rownames(ratios_frag)
+
+ratios_frag$"P value" <- NA
+ratios_p <- ratios_frag %>% 
+  rowwise() %>% 
+  filter(is_constant == FALSE) %>% 
+  # Removing any proteins that have all equal values, which gives an 
+  # error when running t.test()
+  mutate("P value" = t.test(c_across("C1":"C5"), c_across("I1":"I5"),
+         alternative = "two.sided", var.equal = TRUE)$p.value)
+
+ratios_frag <- full_join(ratios_frag, ratios_p)
+
+ratios_frag$`log2(FC)`[ratios_frag$`log2(FC)` == "NaN"] <- NA
+ratios_frag$FC[ratios_frag$FC == "NaN"] <- NA
+```
+
+To address infinite fold change values that appear when a protein is not detected in one condition, we set them to have a unique shape in the final plot and assign a fold change value equal to 1.5 times the maximum valid value.
+
+```{r fragment-setup}
+# Generating overall volcano plot
+# Setting categories for differential expression:
+# not significant, P-value only, FC only, both
+ratios_frag$DiffExp <- case_when(
+  abs(ratios_frag$`log2(FC)`) >= histone_FC_threshold &
+    ratios_frag$`P value` > histone_p_threshold ~ "FC only",
+  abs(ratios_frag$`log2(FC)`) < histone_FC_threshold &
+    ratios_frag$`P value` <= histone_p_threshold ~ "P val. only",
+  abs(ratios_frag$`log2(FC)`) >= histone_FC_threshold &
+    ratios_frag$`P value` <= histone_p_threshold ~ "FC and P val.",
+  .default = "NS"
+)
+ratios_frag$DiffExp <- factor(ratios_frag$DiffExp,
+                           levels = c("FC and P val.", "P val. only", "FC only", "NS"))
+
+ratios_frag$labels <- if_else(
+  abs(ratios_frag$`log2(FC)`) >= histone_FC_threshold & 
+    ratios_frag$`P value` <= histone_p_threshold, ratios_frag$PTM, "")
+
+ratios_frag_plot <- ratios_frag %>% 
+  drop_na() %>% 
+  filter(`log2(FC)` != "-Inf" & `log2(FC)` != "Inf")
+ratios_frag_plot$shape <- "16"
+
+ratios_frag_invalid <- ratios_frag %>% 
+  drop_na() %>% 
+  filter(`log2(FC)` == "-Inf" | `log2(FC)` == "Inf")
+ratios_frag_invalid$`log2(FC)`[ratios_frag_invalid$`log2(FC)` == "-Inf"] <- min(ratios_frag_plot$`log2(FC)`)*1.5
+ratios_frag_invalid$`log2(FC)`[ratios_frag_invalid$`log2(FC)` == "Inf"] <- max(ratios_frag_plot$`log2(FC)`)*1.5
+ratios_frag_invalid$shape <- "17"
+
+ratios_frag_plot <- full_join(ratios_frag_plot, ratios_frag_invalid)
+```
+
+```{r fragment-volcano-plot}
+ggplot(ratios_frag_plot, aes(x = `log2(FC)`, y = -log10(`P value`))) +
+  geom_point(aes(color = DiffExp, shape = shape)) +
+  expand_limits(x = c(min(ratios_frag_plot$`log2(FC)`), max(ratios_frag_plot$`log2(FC)`))) +
+  geom_vline(xintercept = c(histone_FC_threshold, -histone_FC_threshold),
+             alpha = 0.5, linetype = "dashed") +
+  geom_hline(yintercept = -log10(histone_p_threshold),
+             alpha = 0.5, linetype = "dashed") +
+  geom_text_repel(aes(label = labels), show.legend = FALSE, max.overlaps = 20,
+                  size = rel(3)) +
+  guides(shape = "none") +
+  labs(x = "log2(Fold Change)", y = "-log10(P value)",
+       title = "Figure 3.1a: Fragment volcano plot",
+       color = "Category") +
+  theme(legend.position = "bottom") +
+  scale_fill_viridis_d(
+    aesthetics = "color", option = "magma",
+    begin = 0.2, end = 0.9)
+```
+
+## Single
+
+```{r single-histone-processing}
+# Cleaning up names
+ratios_single <- histone_single_raw
+ratios_single$PTM <- ratios_single$PTM %>% 
+  str_replace_all("H31", "H3.1") %>% 
+  str_replace_all("H33", "H3.3")
+
+# Group two conditions together
+ratios_single <- ratios_single %>%
+  relocate(contains("I"), .after = last_col()) %>% 
+  relocate("PTM")
+
+# Calculate infected/control fold change and P value
+ratios_single <- ratios_single %>% 
+  rowwise() %>% 
+  mutate(c_mean = mean(c_across("C1":"C5")),
+         i_mean = mean(c_across("I1":"I5")),
+         FC = c_across(i_mean)/c_across(c_mean),
+         "log2(FC)" = log2(FC),
+         "P value" = t.test(c_across("C1":"C5"), c_across("I1":"I5"),
+                        alternative = "two.sided", var.equal = TRUE)$p.value)
+ratios_single <- column_to_rownames(ratios_single, var = "PTM")
+ratios_single$PTM <- rownames(ratios_single)
+
+ratios_single <- ratios_single %>% 
+  rowwise() %>% 
+  mutate(c_mean = mean(c_across("C1":"C5")),
+         i_mean = mean(c_across("I1":"I5")),
+         FC = c_across(i_mean)/c_across(c_mean),
+         "log2(FC)" = log2(FC),
+         is_constant = all(c_across("C1":"C5") == c_across("I1":"I5")))
+
+ratios_single <- column_to_rownames(ratios_single, var = "PTM")
+ratios_single$PTM <- rownames(ratios_single)
+
+ratios_single$"P value" <- NA
+single_p <- ratios_single %>% 
+  rowwise() %>% 
+  filter(is_constant == FALSE) %>% 
+  # Removing any proteins that have all equal values, which gives an 
+  # error when running t.test()
+  mutate("P value" = t.test(c_across("C1":"C5"), c_across("I1":"I5"),
+         alternative = "two.sided", var.equal = TRUE)$p.value)
+
+ratios_single <- full_join(ratios_single, single_p)
+
+ratios_single$`log2(FC)`[ratios_single$`log2(FC)` == "NaN"] <- NA
+ratios_single$FC[ratios_single$FC == "NaN"] <- NA
+```
+
+```{r single-setup}
+# Generating overall volcano plot - same as previous
+# Setting categories for differential expression:
+# not significant, P-value only, FC only, both
+ratios_single$DiffExp <- case_when(
+  abs(ratios_single$`log2(FC)`) >= histone_FC_threshold &
+    ratios_single$`P value` > histone_p_threshold ~ "FC only",
+  abs(ratios_single$`log2(FC)`) < histone_FC_threshold &
+    ratios_single$`P value` <= histone_p_threshold ~ "P val. only",
+  abs(ratios_single$`log2(FC)`) >= histone_FC_threshold &
+    ratios_single$`P value` <= histone_p_threshold ~ "FC and P val.",
+  .default = "NS"
+)
+ratios_single$DiffExp <- factor(ratios_single$DiffExp,
+                           levels = c("FC and P val.", "P val. only", "FC only", "NS"))
+
+# Setting labels
+ratios_single$labels <- if_else(
+  abs(ratios_single$`log2(FC)`) >= histone_FC_threshold &
+    ratios_single$`P value` <= histone_p_threshold, ratios_single$PTM, "")
+
+ratios_single_plot <- ratios_single %>% 
+  drop_na() %>% 
+  filter(`log2(FC)` != "-Inf" & `log2(FC)` != "Inf")
+ratios_single_plot$shape <- "16"
+
+ratios_single_invalid <- ratios_single %>% 
+  drop_na() %>% 
+  filter(`log2(FC)` == "-Inf" | `log2(FC)` == "Inf")
+ratios_single_invalid$`log2(FC)`[ratios_single_invalid$`log2(FC)` == "-Inf"] <- min(ratios_single_plot$`log2(FC)`)*1.5
+ratios_single_invalid$`log2(FC)`[ratios_single_invalid$`log2(FC)` == "Inf"] <- max(ratios_single_plot$`log2(FC)`)*1.5
+ratios_single_invalid$shape <- "17"
+
+ratios_single_plot <- full_join(ratios_single_plot, ratios_single_invalid)
+```
+
+```{r single-volcano-plot}
+ggplot(ratios_single_plot, aes(x = `log2(FC)`, y = -log10(`P value`))) +
+  geom_point(aes(color = DiffExp, shape = shape)) +
+  expand_limits(x = c(min(ratios_single_plot$`log2(FC)`), max(ratios_single_plot$`log2(FC)`))) +
+  geom_vline(xintercept = c(histone_FC_threshold, -histone_FC_threshold),
+             alpha = 0.5, linetype = "dashed") +
+  geom_hline(yintercept = -log10(histone_p_threshold),
+             alpha = 0.5, linetype = "dashed") +
+  geom_text_repel(aes(label = labels), show.legend = FALSE, max.overlaps = 20,
+                  size = rel(3)) +
+  guides(shape = "none") +
+  labs(x = "log2(Fold Change)", y = "-log10(P value)",
+       title = "Figure 3.1b: Net histone volcano plot",
+       color = "Category") +
+  theme(legend.position = "bottom") +
+  scale_fill_viridis_d(
+    aesthetics = "color", option = "magma",
+    begin = 0.2, end = 0.9
+  )
+```
+
+# Differential expression
+
+Here we begin a comparative analysis of the two larger datasets (total proteome and phosphoproteome).
+
+```{r overall-venn, fig.asp = 0.7}
+# Venn diagram to quickly look at proteome/phosphoproteome overlap
+venn_lists <- list_to_data_frame(list("Set 1" = total_KB$SYMBOL2, "Set 2" = phospho_raw$SYMBOL2))
+ggvenn(venn_lists, set_name_size = 5) +
+  ggtitle("Figure 4a: Set overlap") +
+  theme(plot.margin = margin(1, 1, 1, 2))
+```
+
+## Total proteome infected vs control
+
+Section 4.1 directly compares the total proteome to itself. Here, we examine the sets of proteins identified exclusively in infected cells (identified by columns with "JMI"), control cells, or both. Detection inputs for these columns can be "High", "Peak Found", or "n/a". To identify a protein found only in one condition, we check that at least one replicate from that condition is not "n/a". We then check that, simultaneously, all replicates from the other condition are equal to "n/a", indicating the protein was not found. If both requirements are met, a string is mapped to that protein indicating its presence. If a protein has at least one replicate not equal to "n/a" in both experimental conditions, "All" is assigned, indicating overlap.
+
+```{r condition-cases}
+# Identify proteins expressed in both conditions, only control, or only infected.
+total_diff_valid <- total_KB %>%  mutate(`Differential?` = case_when(
+  # Control ONLY
+  # BCG empty, at least 1 ctrl not empty
+  (((`Found in Sample: F1: Sample, Control` != "n/a") |
+      (`Found in Sample: F2: Sample, Control` != "n/a") |
+      (`Found in Sample: F3: Sample, Control` != "n/a")) &
+     ((`Found in Sample: F4: Sample, JMI` == "n/a") &
+        (`Found in Sample: F5: Sample, JMI` == "n/a") &
+        (`Found in Sample: F5: Sample, JMI` == "n/a") &
+        (`Found in Sample: F6: Sample, JMI` == "n/a") &
+        (`Found in Sample: F7: Sample, JMI` == "n/a") &
+        (`Found in Sample: F8: Sample, JMI` == "n/a"))) ~ "Control only",
+  # Infected ONLY
+  # Control empty, at least one BCG not empty
+    (((`Found in Sample: F1: Sample, Control` == "n/a") &
+        (`Found in Sample: F2: Sample, Control` == "n/a") &
+        (`Found in Sample: F3: Sample, Control` == "n/a")) &
+       ((`Found in Sample: F4: Sample, JMI` != "n/a") |
+          (`Found in Sample: F5: Sample, JMI` != "n/a") |
+          (`Found in Sample: F5: Sample, JMI` != "n/a") |
+          (`Found in Sample: F6: Sample, JMI` != "n/a") |
+          (`Found in Sample: F7: Sample, JMI` != "n/a") |
+          (`Found in Sample: F8: Sample, JMI` != "n/a"))) ~ "BCG only",
+    # Both
+    .default = "All"))
+```
+
+Euler plots are sized proportionally to their groups and are more friendly to multiple sets. To generate the Euler plots, the input needs to be a single column containing all peptides found in that condition. The `print` command provides summary statistics to ensure that the Euler plot does not misrepresent the data.
+
+```{r euler-lists}
+# Pivoting to make a wider table
+total_wider_valid <- pivot_wider(total_diff_valid,
+  names_from = `Differential?`, values_from = `SYMBOL2`)
+  
+# Create a list of infection only peptides, removing empty rows (NA)
+BCG_dist_valid <- total_wider_valid %>% distinct(`BCG only`) %>% drop_na()
+colnames(BCG_dist_valid) <- c("Peptides")
+
+# Create a list of control only peptides, removing empty rows (NA)
+Ctrl_dist_valid <- total_wider_valid %>% distinct(`Control only`) %>% drop_na()
+colnames(Ctrl_dist_valid) <- c("Peptides")
+
+# Create a list of peptides present in both, removing empty rows (NA)
+All_dist_valid <- total_wider_valid %>% distinct(`All`) %>% drop_na()
+colnames(All_dist_valid) <- c("Peptides")
+
+# Create a list of BCG + both
+BCG_both_dist_valid <- add_row(BCG_dist_valid, All_dist_valid) %>% distinct()
+colnames(BCG_both_dist_valid) <- c("Infected")
+
+# Create a list of control + both
+Ctrl_both_dist_valid <- add_row(Ctrl_dist_valid, All_dist_valid) %>% distinct()
+colnames(Ctrl_both_dist_valid) <- c("Control")
+
+# Generate plot
+fit_total_valid <- euler(c(BCG_both_dist_valid, Ctrl_both_dist_valid))
+plot(fit_total_valid,
+  quantities = TRUE,
+  fills = c("palevioletred1", "cornflowerblue", "gainsboro"),
+  main = "Figure 4.1a: Condition Euler plot"
+)
+```
+
+```{r}
+print(fit_total_valid)
+```
+
+# Disease enrichment
+
+To complete the integrated analysis, we examine a gene-disease association (GDA) summary from DisGeNET. The GDA Excel sheets can be downloaded directly from the website after identifying the disease of interest. Point the `read_xlsx` call to this file.
+
+```{r GDA, fig.asp = 1}
+BC_xl <- read_xlsx("~/Documents/R/Final analysis/C2145472_disease_gda_summary.xlsx")
+
+# Get lists of proteins that were significant AND above the FC threshold
+total_FC <- filter(total_significant, abs(`log2(FC)`) > total_FC_threshold)
+phospho_FC <- filter(phospho_significant, abs(`log2(FC)`) > phospho_FC_threshold)
+
+# Generate plot
+ggvenn(list(
+  "NMIBC" = BC_xl$Gene,
+  "Total proteome" = total_FC$SYMBOL2,
+  "Phosphoproteome" = phospho_FC$SYMBOL2
+)) + ggtitle("Figure 5a: Venn diagram") + theme(
+  plot.title.position = "plot",
+  plot.title = element_text(hjust = 0.5))
+fit_BC <- euler(list(
+  "NMIBC" = BC_xl$Gene,
+  "Total proteome" = total_FC$SYMBOL2,
+  "Phosphoproteome" = phospho_FC$SYMBOL2
+))
+plot(fit_BC, quantities = TRUE, main = "Figure 5a: GDA Euler plot")
+```
+
+```{r}
+print(list_to_data_frame(fit_BC))
+```
+
+From this table, there is a missing overlap region in all three sets that the Euler diagram could not resolve, as indicated by the non-zero residuals. In this case, the Venn diagram is the better choice.
+
+```{r GDA-list, results = "asis"}
+# Print the list of proteins in each intersection
+cat(paste("**NMIBC/Phospho:** ", paste(intersect(BC_xl$Gene, phospho_FC$SYMBOL2), collapse = ", ")))
+cat(paste("**NMIBC/Total:** ", paste(intersect(BC_xl$Gene, total_FC$SYMBOL2), collapse = ", ")))
+cat(paste("**Total/Phospho:** ", paste(intersect(total_FC$SYMBOL2, phospho_FC$SYMBOL2), collapse = ", ")))
+cat(paste("**NMIBC/Phospho/Total:** ", paste(intersect(intersect(BC_xl$Gene, phospho_FC$SYMBOL2), total_FC$SYMBOL2), collapse = ", ")))
+```
