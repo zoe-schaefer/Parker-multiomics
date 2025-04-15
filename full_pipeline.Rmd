@@ -6,7 +6,6 @@ output:
     toc: true
     toc_float: true
     code_folding: show
-    number_sections: true
     code_download: true
     df_print: kable
 bibliography: references.bib
@@ -23,8 +22,9 @@ knitr::opts_chunk$set(
 
 library(pacman)
 p_load(
-  EnhancedVolcano, readxl, tidyverse, lintr, Homo.sapiens, DOSE, data.table,
-  clusterProfiler, enrichplot, ggvenn, OrganismDbi, eulerr, httpgd, viridis, scales
+  rmarkdown, clusterProfiler, data.table, DOSE, EnhancedVolcano, enrichplot,
+  eulerr, ggvenn, Homo.sapiens, igraph, knitr, lintr, OrganismDbi, paletteer,
+  qualpalr, readxl, scales, tidyverse, viridis
 )
 
 theme_pipeline <- theme_set(theme_gray() + theme(
@@ -32,7 +32,7 @@ theme_pipeline <- theme_set(theme_gray() + theme(
   plot.title = element_text(hjust = 0.5)))
 ```
 
-# Proteome data processing
+# 1. Proteome data processing
 
 This section is designed to work with normalized abundance data from Proteome Discoverer. The `total_path` variable should point directly to the Excel file containing the data you would like to use. The range identified in the `read_xlsx` command should contain columns from "Accession" to the final "Found in Sample:" column.
 
@@ -41,15 +41,16 @@ This section is designed to work with normalized abundance data from Proteome Di
 total_path <- "~/Documents/R/33060_Control_vs_Infection_JMI_abundances_normalizedabundances.xlsx"
 total_KB <- read_xlsx(path = total_path, range = cell_cols(c("D:BI")))
 
-total_KB <- select(
-  total_KB,
-  c("Accession",
-    starts_with(
-      c("Abundance Ratio (log2):", "Abundance Ratio Adj. P-Value:", "Found in Sample:")
+total_KB <- total_KB %>% 
+  dplyr::select(c("Accession",
+                  dplyr::starts_with(c("Abundance Ratio (log2):",
+                                "Abundance Ratio Adj. P-Value:",
+                                "Found in Sample:")
       )
     )
   )
 ```
+
 ```{r total-key-map, message=FALSE}
 # Retrieve keys and assign symbol to numerical Entrez ID
 # (KEGG mapping gives an error if this isn't included)
@@ -67,9 +68,11 @@ rm(reflist)
 # Drop invalid data (NA), drop any duplicate cases, rename columns for clarity
 total_KB <- total_KB %>%
   drop_na(SYMBOL) %>%
-  distinct(SYMBOL, .keep_all = TRUE) %>%
-  rename("log2(FC)" = starts_with("Abundance Ratio (log2)"),
-         "P value" = starts_with("Abundance Ratio Adj. P-Value")
+  distinct(SYMBOL, .keep_all = TRUE)
+  
+total_KB <- total_KB %>% 
+  dplyr::rename("log2(FC)" = dplyr::starts_with("Abundance Ratio (log2)"),
+         "P value" = dplyr::starts_with("Abundance Ratio Adj. P-Value")
 )
 
 # Remove points with invalid P values (horizontal line at the top of a plot),
@@ -87,7 +90,7 @@ total_FC_threshold <- 0.5
 total_significant <- filter(total_KB, `P value` < total_p_threshold)
 ```
 
-## Volcano
+## 1.1. Volcano
 
 Figure 1.1a is a general volcano plot, showing a visualization of the full dataset.
 
@@ -142,7 +145,7 @@ If there are known genes of interest to be included in a plot, Figure 1.1b plots
 # Defining known genes of interest for a second plot
 Group1 <- c("MORF4L1", "SAMSN1", "DTX3L", "MBD3",  "HSF1", "EYA3",
                "NCAPD2", "TAF9", "PPP4C", "ZNF638")
-Group2 <- c("CD276", "CDK6", "CD9", "CD82", "NFKB1", "BST2", "CTSH")
+Group2 <- c("CD9", "CD82", "NFKB1", "BST2", "CTSH")
 
 # Assigning shapes and labels for each group in the volcano plot,
 # leaving points unlabeled if outside the groups
@@ -173,11 +176,11 @@ ggplot(arrange(total_KB, CatNames), aes(x = `log2(FC)`, y = -log10(`P value`))) 
   scale_fill_viridis_d("Category",
     aesthetics = "color", option = "magma",
     begin = 0.2, end = 0.9,
-    labels = c("Group 2", "Group 1", "None")
+    labels = c("Group 1", "Group 2", "None")
   )
 ```
 
-## Pathway enrichment
+## 1.2. Pathway enrichment
 
 This section performs a pathway analysis on the significant proteins alone to reduce computational load when calling `enrichGO` and `enrichKEGG`. These variables can be easily adjusted to analyze all proteins together if desired.
 
@@ -199,10 +202,14 @@ total_KEGG_down <- enrichKEGG(total_significant_down$ENTREZID)
 # dotplot() can be used for an overview of the relationships between key terms
 dotplot(total_KEGG_up, showCategory = 20, font.size = rel(1),
         title = "Figure 1.2a: Total KEGG up") +
-  theme(plot.title.position = "plot", plot.title = element_text(hjust = 0.5))
+  theme(plot.title.position = "plot", plot.title = element_text(hjust = 0.5)) +
+  scale_fill_viridis(
+    aesthetics = "color", option = "magma",
+    name = "Adjusted P", begin = 0, end = 0.9
+  )
 dotplot(total_GO_up, showCategory = 20, font.size = rel(1),
         title = "Figure 1.2b: Total GO up (unwrapped)") +
-  theme(plot.title.position = "plot", plot.title = element_text(hjust = 0.5))
+  theme(plot.title.position = "plot", plot.title = element_text(hjust = 0.5)) 
 dotplot(total_GO_up, showCategory = 20, font.size = rel(1),
         title = "Figure 1.2c: Total GO up (wrapped)", label_format = 60) +
   theme(plot.title.position = "plot", plot.title = element_text(hjust = 0.5))
@@ -416,7 +423,17 @@ emapplot(total_GO_up_MF, layout = "nicely", node_label = "none") +
         plot.margin = margin(1, 1, 1, 1))
 ```
 
-# Phosphoproteome data processing
+```{r clear-1}
+# Clearing large variables
+rm(total_GO_down, total_GO_down_BP, total_GO_down_CC, total_GO_down_MF,
+   total_GO_down_slice_BP, total_GO_down_slice_CC, total_GO_down_slice_MF,
+   total_GO_up, total_GO_up_BP, total_GO_up_CC, total_GO_up_MF,
+   total_GO_up_slice_ALL, total_GO_up_slice_BP, total_GO_up_slice_CC,
+   total_GO_up_slice_MF,
+   total_KEGG_down, total_KEGG_up, total_KEGG_up_slice)
+```
+
+# 2. Phosphoproteome data processing
 
 This section is written to interpret phosphoproteome data. Here, we do not account for particular phosphorylation sites or their functions. The original data is from @choudhary2020. Below is a reprocessing of this data to align with the total and histone proteome.
 
@@ -438,7 +455,7 @@ phospho_FC_threshold <- 0.5
 phospho_significant <- filter(phospho_raw, `P value` < phospho_p_threshold)
 ```
 
-## Volcano
+## 2.1. Volcano
 
 ```{r phospho-grouping}
 # Repeating the processes from before
@@ -497,32 +514,40 @@ Group1_phospho_sub <- c(
   "MEN1", "MGA", "MRGBP", "MTA1", "NCOA6", "PHC2", "PHF20L1", "REST",
   "RING1", "RUVBL1", "SAP130", "SCML2", "SIRT3", "SIRT6", "EP300"
 )
-phospho_raw$labels <- if_else(
-  abs(phospho_raw$`log2(FC)`) >= phospho_FC_threshold &
-    phospho_raw$`P value` <= phospho_p_threshold, phospho_raw$SYMBOL2, "")
+phospho_raw$CatShapes <- case_when(
+  phospho_raw$SYMBOL2 %in% Group1_phospho ~ "1",
+  phospho_raw$SYMBOL2 %in% Group2_phospho ~ "2",
+  .default = "20"
+)
+
+phospho_raw$CatNames <- case_when(
+  phospho_raw$SYMBOL2 %in% Group1_phospho_sub |
+    phospho_raw$SYMBOL2 %in% Group2_phospho ~ phospho_raw$SYMBOL2,
+  .default = ""
+)
 ```
 
 ```{r phospho-grouped-volcano-plot}
-ggplot(phospho_raw, aes(x = `log2(FC)`, y = -log10(`P value`))) +
-  geom_point(aes(color = DiffExp, alpha = DEAlpha)) +
+ggplot(arrange(phospho_raw, desc(CatShapes)), aes(x = `log2(FC)`, y = -log10(`P value`))) +
+  geom_point(aes(color = CatShapes, shape = CatShapes)) +
   geom_vline(xintercept = c(phospho_FC_threshold, -phospho_FC_threshold),
              alpha = 0.5, linetype = "dashed") +
   geom_hline(yintercept = -log10(phospho_p_threshold),
              alpha = 0.5, linetype = "dashed") +
-  geom_text_repel(aes(label = labels), show.legend = FALSE, max.overlaps = 20,
+  geom_text_repel(aes(label = CatNames), show.legend = FALSE, max.overlaps = Inf,
                   size = rel(3)) +
-  guides(alpha = "none") +
+  guides(alpha = "none", shape = "none") +
   labs(x = "log2(Fold Change)", y = "-log10(P value)",
-       title = "Figure 2.1a: Volcano plot",
-       color = "Category") +
+       title = "Figure 2.1a: Volcano plot") +
   theme(legend.position = "bottom") +
-  scale_fill_viridis_d(
+  scale_fill_viridis_d("Category",
     aesthetics = "color", option = "magma",
-    begin = 0.2, end = 0.9
+    begin = 0.2, end = 0.9,
+    labels = c("Group 1", "Group 2", "None")
   )
 ```
 
-## Pathway enrichment
+## 2.2. Pathway enrichment
 
 ```{r phospho-enrich}
 # Separate phospho_significant subset into upregulated vs downregulated
@@ -787,7 +812,23 @@ emapplot(phospho_GO_down_MF, layout = "nicely", node_label = "none") +
         plot.margin = margin(1, 1, 1, 1))
 ```
 
-# Histone processing
+```{r clear-2}
+# Clearing large variables
+rm(phospho_GO_down, phospho_GO_down_BP, phospho_GO_down_CC, phospho_GO_down_MF,
+   phospho_GO_down_slice_BP, phospho_GO_down_slice_CC, phospho_GO_down_slice_MF,
+   phospho_GO_up, phospho_GO_up_BP, phospho_GO_up_CC, phospho_GO_up_MF,
+   phospho_GO_up_slice_ALL, phospho_GO_up_slice_BP, phospho_GO_up_slice_CC,
+   phospho_GO_up_slice_MF,
+   phospho_KEGG_down, phospho_KEGG_down_slice,
+   phospho_KEGG_up, phospho_KEGG_up_slice,
+   total_significant_up, total_significant_down,
+   total_up_bound, total_down_bound,
+   phospho_significant_up, phospho_significant_down,
+   phospho_up_bound, phospho_down_bound,
+   kegg_category)
+```
+
+# 3. Histone processing
 
 This section processes data output from EpiProfile. We choose to assess both tail fragments and individual summed PTMs to indicate co-occurrence, which may signify activity of certain epigenetic actors. Note that the exported `.xls` files will have to be opened manually one time, then saved again as `.xls(x)` format due to the output format. Into the `range` argument, pass the cell location of the first peptide name ("H3_3_8 unmod" in our data) to set the top left corner, then (NA, [target col]) as the second location to set the bottom right corner. This section assumes the data is separating two conditions, infected and control.
 
@@ -805,7 +846,7 @@ histone_p_threshold <- 0.05
 histone_FC_threshold <- 0.5
 ```
 
-## Fragments
+## 3.1. Fragments
 
 Name cleanup is not strictly necessary but makes labels easier to read. There may also be some long amino acid strings such as "H1 1-35 H12.SETAPAAPAAAPPAEKAPVKKKAAKKAGGTPR" that indicate a unique isoform (H1.2 in this case). These can also be modified by calling `str_replace_all` as desired.
 
@@ -916,7 +957,7 @@ ratios_frag_plot <- full_join(ratios_frag_plot, ratios_frag_invalid)
 
 ```{r fragment-volcano-plot}
 ggplot(ratios_frag_plot, aes(x = `log2(FC)`, y = -log10(`P value`))) +
-  geom_point(aes(color = DiffExp, shape = shape)) +
+  geom_point(aes(color = DiffExp)) +
   expand_limits(x = c(min(ratios_frag_plot$`log2(FC)`), max(ratios_frag_plot$`log2(FC)`))) +
   geom_vline(xintercept = c(histone_FC_threshold, -histone_FC_threshold),
              alpha = 0.5, linetype = "dashed") +
@@ -924,7 +965,6 @@ ggplot(ratios_frag_plot, aes(x = `log2(FC)`, y = -log10(`P value`))) +
              alpha = 0.5, linetype = "dashed") +
   geom_text_repel(aes(label = labels), show.legend = FALSE, max.overlaps = 20,
                   size = rel(3)) +
-  guides(shape = "none") +
   labs(x = "log2(Fold Change)", y = "-log10(P value)",
        title = "Figure 3.1a: Fragment volcano plot",
        color = "Category") +
@@ -934,7 +974,7 @@ ggplot(ratios_frag_plot, aes(x = `log2(FC)`, y = -log10(`P value`))) +
     begin = 0.2, end = 0.9)
 ```
 
-## Single
+## 3.2. Single
 
 ```{r single-histone-processing}
 # Cleaning up names
@@ -1020,11 +1060,29 @@ ratios_single_invalid$`log2(FC)`[ratios_single_invalid$`log2(FC)` == "Inf"] <- m
 ratios_single_invalid$shape <- "17"
 
 ratios_single_plot <- full_join(ratios_single_plot, ratios_single_invalid)
+
+ratios_single$labels <- if_else(
+  ratios_single$`P value` <= histone_p_threshold, ratios_single$PTM, "")
+
+ratios_single_plot <- ratios_single %>% 
+  drop_na() %>% 
+  filter(`log2(FC)` != "-Inf" & `log2(FC)` != "Inf")
+ratios_single_plot$shape <- "16"
+
+ratios_single_invalid <- ratios_single %>% 
+  drop_na() %>% 
+  filter(`log2(FC)` == "-Inf" | `log2(FC)` == "Inf")
+ratios_single_invalid$`log2(FC)`[ratios_single_invalid$`log2(FC)` == "-Inf"] <- min(ratios_single_plot$`log2(FC)`)*1.5
+ratios_single_invalid$`log2(FC)`[ratios_single_invalid$`log2(FC)` == "Inf"] <- max(ratios_single_plot$`log2(FC)`)*1.5
+ratios_single_invalid$shape <- "17"
+
+ratios_single_plot <- full_join(ratios_single_plot, ratios_single_invalid)
 ```
+
 
 ```{r single-volcano-plot}
 ggplot(ratios_single_plot, aes(x = `log2(FC)`, y = -log10(`P value`))) +
-  geom_point(aes(color = DiffExp, shape = shape)) +
+  geom_point(aes(color = DiffExp)) +
   expand_limits(x = c(min(ratios_single_plot$`log2(FC)`), max(ratios_single_plot$`log2(FC)`))) +
   geom_vline(xintercept = c(histone_FC_threshold, -histone_FC_threshold),
              alpha = 0.5, linetype = "dashed") +
@@ -1032,7 +1090,6 @@ ggplot(ratios_single_plot, aes(x = `log2(FC)`, y = -log10(`P value`))) +
              alpha = 0.5, linetype = "dashed") +
   geom_text_repel(aes(label = labels), show.legend = FALSE, max.overlaps = 20,
                   size = rel(3)) +
-  guides(shape = "none") +
   labs(x = "log2(Fold Change)", y = "-log10(P value)",
        title = "Figure 3.1b: Net histone volcano plot",
        color = "Category") +
@@ -1043,7 +1100,14 @@ ggplot(ratios_single_plot, aes(x = `log2(FC)`, y = -log10(`P value`))) +
   )
 ```
 
-# Differential expression
+```{r clear-3}
+# Clearing large variables
+rm(histone_frag_raw, histone_single_raw, ratios_frag, ratios_frag_invalid,
+   ratios_frag_plot, ratios_p, ratios_single, ratios_single_invalid,
+   single_p)
+```
+
+# 4. Differential expression
 
 Here we begin a comparative analysis of the two larger datasets (total proteome and phosphoproteome).
 
@@ -1055,7 +1119,7 @@ ggvenn(venn_lists, set_name_size = 5) +
   theme(plot.margin = margin(1, 1, 1, 2))
 ```
 
-## Total proteome infected vs control
+## 4.1. Total proteome infected vs control
 
 Section 4.1 directly compares the total proteome to itself. Here, we examine the sets of proteins identified exclusively in infected cells (identified by columns with "JMI"), control cells, or both. Detection inputs for these columns can be "High", "Peak Found", or "n/a". To identify a protein found only in one condition, we check that at least one replicate from that condition is not "n/a". We then check that, simultaneously, all replicates from the other condition are equal to "n/a", indicating the protein was not found. If both requirements are met, a string is mapped to that protein indicating its presence. If a protein has at least one replicate not equal to "n/a" in both experimental conditions, "All" is assigned, indicating overlap.
 
@@ -1124,11 +1188,11 @@ plot(fit_total_valid,
 )
 ```
 
-```{r}
+```{r euler-fit}
 print(fit_total_valid)
 ```
 
-# Disease enrichment
+# 5. Disease enrichment
 
 To complete the integrated analysis, we examine a gene-disease association (GDA) summary from DisGeNET. The GDA Excel sheets can be downloaded directly from the website after identifying the disease of interest. Point the `read_xlsx` call to this file.
 
@@ -1155,8 +1219,8 @@ fit_BC <- euler(list(
 plot(fit_BC, quantities = TRUE, main = "Figure 5a: GDA Euler plot")
 ```
 
-```{r}
-print(list_to_data_frame(fit_BC))
+```{r GDA-fit}
+print((fit_BC))
 ```
 
 From this table, there is a missing overlap region in all three sets that the Euler diagram could not resolve, as indicated by the non-zero residuals. In this case, the Venn diagram is the better choice.
@@ -1167,4 +1231,162 @@ cat(paste("**NMIBC/Phospho:** ", paste(intersect(BC_xl$Gene, phospho_FC$SYMBOL2)
 cat(paste("**NMIBC/Total:** ", paste(intersect(BC_xl$Gene, total_FC$SYMBOL2), collapse = ", ")))
 cat(paste("**Total/Phospho:** ", paste(intersect(total_FC$SYMBOL2, phospho_FC$SYMBOL2), collapse = ", ")))
 cat(paste("**NMIBC/Phospho/Total:** ", paste(intersect(intersect(BC_xl$Gene, phospho_FC$SYMBOL2), total_FC$SYMBOL2), collapse = ", ")))
+```
+
+# 6. Epigenetic network
+This section develops a network visualization of all epigenetic interactors as defined by EpiFactors (https://epifactors.autosome.org/). Increased dataset size may make networks difficult to graph, so an alternative visualization is provided that breaks down the key complexes involved.
+
+```{r network-setup}
+genes_epi <- fread("~/Documents/R/genes.csv")
+total_join <- inner_join(dplyr::select(genes_epi, !c("HGNC approved name", "UniProt ID (human)", "Pfam domains", "UniProt ID (mouse)")), dplyr::select(total_significant, "log2(FC)", "P value", "SYMBOL2"), by = join_by("HGNC approved symbol" == "SYMBOL2")) %>% mutate("Source" = "Total")
+
+phospho_join <- inner_join(dplyr::select(genes_epi, !c("HGNC approved name", "UniProt ID (human)", "Pfam domains", "UniProt ID (mouse)")), dplyr::select(phospho_significant, "log2(FC)", "P value", "SYMBOL2"), by = join_by("HGNC approved symbol" == "SYMBOL2")) %>% mutate("Source" = "Phospho")
+
+joined_data <- full_join(total_join, phospho_join)
+```
+
+```{r network-proteins}
+# Plotting all relevant proteins from the two combined datasets
+ggplot(joined_data, aes(x = `log2(FC)`, y = -log10(`P value`))) +
+  geom_point(aes(color = Source)) +
+  geom_vline(xintercept = c(total_FC_threshold, -total_FC_threshold),
+             alpha = 0.5, linetype = "dashed") +
+  geom_hline(yintercept = -log10(total_p_threshold),
+             alpha = 0.5, linetype = "dashed") +
+  labs(x = "log2(Fold Change)", y = "-log10(P value)",
+       title = "Figure 6a: Volcano plot") +
+  geom_text_repel(aes(label = joined_data$"HGNC approved symbol"), show.legend = FALSE, size = rel(3)) +
+  theme(legend.position = "bottom") +
+  scale_fill_viridis_d(
+    aesthetics = "color", option = "magma",
+    begin = 0.2, end = 0.9
+  )
+```
+
+```{r network-histone-import}
+# Formatting histone targets
+targets <- str_replace_all(str_flatten_comma(str_unique(c(joined_data$Product, joined_data$`Target entity`))), ", ", "|")
+
+# filter by that list
+total_histone_int <- filter(ratios_single_plot, grepl(targets, PTM))
+
+# Making sure that no histone data has gotten lost in processing - 
+# this should match the figure from the earlier section
+ggplot(total_histone_int, aes(x = `log2(FC)`, y = -log10(`P value`))) +
+  geom_point() +
+  geom_vline(xintercept = c(total_FC_threshold, -total_FC_threshold),
+             alpha = 0.5, linetype = "dashed") +
+  geom_hline(yintercept = -log10(total_p_threshold),
+             alpha = 0.5, linetype = "dashed") +
+  labs(x = "log2(Fold Change)", y = "-log10(P value)",
+       title = "Figure 6b: Volcano plot") +
+  geom_text_repel(aes(label = total_histone_int$PTM), show.legend = FALSE, size = rel(3)) +
+  theme(legend.position = "bottom") +
+  scale_fill_viridis_d(
+    aesthetics = "color", option = "magma",
+    begin = 0.2, end = 0.9
+  )
+```
+
+```{r network-genes}
+# Pivoting and formatting the gene list
+genes_pivoted <- dplyr::select(genes_epi, c("HGNC approved symbol", "Protein complex", "Target entity", "Product")) %>% dplyr::rename("Symbol" = "HGNC approved symbol", "Complex" = "Protein complex", "Target" = "Target entity", "Product" = "Product")
+
+genes_pivoted <- genes_pivoted %>% 
+  separate_wider_delim(cols = c("Complex", "Target", "Product"), delim = ", ",
+                       names_sep = "_", too_few = "align_start")
+
+genes_pivoted <- genes_pivoted %>% 
+  pivot_longer(cols = dplyr::starts_with("Complex"), names_to = NULL,
+               values_to = "Complex", values_drop_na = TRUE) %>% 
+  pivot_longer(cols = dplyr::starts_with("Target"), names_to = NULL,
+               values_to = "Target", values_drop_na = TRUE) %>% 
+  pivot_longer(cols = dplyr::starts_with("Product"), names_to = NULL,
+               values_to = "Product", values_drop_na = TRUE)
+
+genes_filtered_complex <- filter(genes_pivoted, Complex != "#")
+genes_filtered_target <- filter(genes_pivoted, Target != "#")
+genes_filtered_product <- filter(genes_pivoted, Product != "#")
+
+genes_data_joined <- inner_join(genes_pivoted,
+                                dplyr::select(joined_data, c("HGNC approved symbol",
+                                                      "log2(FC)", "P value", "Source")),
+                                by = join_by("Symbol" == "HGNC approved symbol"),
+                                relationship = "many-to-many")
+```
+
+```{r network-format}
+# Getting the lists into the right format for the igraph visualization
+genes_histone_pivoted <- pivot_longer(genes_pivoted, cols = c("Target", "Product"), names_to = NULL,
+             values_to = "PTM")
+
+genes_histone_joined <- inner_join(genes_histone_pivoted,
+                                dplyr::select(total_histone_int, c("PTM",
+                                                      "log2(FC)", "P value")),
+                                by = join_by("PTM" == "PTM"),
+                                relationship = "many-to-many")
+genes_histone_joined <- relocate(genes_histone_joined, Complex, .after = PTM)
+genes_histone_joined[genes_histone_joined == "#"] <- "No ID"
+
+complexes <- unique(genes_histone_joined$Complex)
+n_complexes <- seq(1, length(complexes))
+color_opts <- c("#FFFFFF", qualpal(n = (length(complexes) - 1), colorspace = "rainbow")$hex)
+complex_df <- data.frame(complexes, n_complexes, color = color_opts)
+
+complex_vertices <- data.frame(vertices = c(unique(genes_histone_joined$Symbol), unique(genes_histone_joined$PTM)))
+
+genes_histone_joined <- full_join(genes_histone_joined, complex_df, by = join_by("Complex" == "complexes"))
+
+complex_vertices <- left_join(complex_vertices, genes_histone_joined, by = join_by("vertices" == "Symbol"), multiple = "first")
+complex_vertices[complex_vertices == "#"] <- "No ID"
+
+complex_graph <- graph_from_data_frame(genes_histone_joined, vertices = complex_vertices, directed = FALSE)
+```
+
+The below figure is the network developed from the data and enriched gene set. Proteins that could be assigned to known complexes are colored in respectively.
+
+```{r network-graph}
+plot(complex_graph, edge.color = "black", vertex.label.color = "black", vertex.size = 8, layout = layout_nicely, rescale = TRUE, asp = 0)
+title("Figure 6c: Network visualization")
+```
+
+This legend shows all identified complexes and their colors, whether or not they made it into the network visualization.
+
+```{r network-legend}
+plot.new()
+legend(x = "center", legend = unique(genes_histone_joined$Complex), fill = unique(genes_histone_joined$color), ncol = 3, cex = 0.75)
+title("Figure 6d: Legend")
+```
+
+These alternative visualizations show the members of the identified complexes without connections.
+
+```{r network-bars}
+sig_network <- distinct(group_by(filter(genes_histone_joined, Complex != "No ID"), Complex), Symbol, .keep_all = TRUE)
+sig_network["weight"] <- 1
+sig_network$Complex <- factor(sig_network$Complex, levels = unique(as.character(sig_network$Complex)))
+
+ggplot(sig_network, aes(x = Complex, y = weight)) +
+  geom_col(aes(fill = Complex), position = "stack") +
+  geom_label(aes(label = Symbol, angle = 30), size = 3,
+             position = position_stack(vjust = 0.5)) +
+  guides(fill = "none") +
+  theme(axis.text.x = element_text(angle = 30, vjust = 1, hjust=1),
+        axis.title.x = element_blank(), axis.title.y = element_blank(),
+        plot.margin = margin(t = 10, r = 10, b = 10, l = 10)) +
+  scale_fill_manual(values = unique(sig_network$color)) +
+  scale_x_discrete(labels = label_wrap(10)) +
+  labs(title = "Figure 6e: Network components")
+```
+
+
+```{r network-bins}
+ggplot(sig_network, aes(x = Complex, y = Symbol, fill = PTM)) +
+  geom_bin_2d() +
+  theme(axis.text.x = element_text(angle = 30, vjust = 1, hjust = 1),
+        axis.title.x = element_blank(), axis.title.y = element_blank(),
+        plot.margin = margin(t = 10, r = 10, b = 10, l = 10)) +
+  scale_fill_paletteer_d("ggsci::default_igv") +
+  scale_x_discrete(labels = label_wrap(10)) +
+  scale_y_discrete(limits = rev) +
+  labs(title = "Figure 6f: Network bins")
 ```
